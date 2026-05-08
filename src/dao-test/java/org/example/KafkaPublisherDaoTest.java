@@ -1,8 +1,8 @@
 package org.example;
 
+import io.kiw.luxis.result.Result;
 import io.kiw.luxis.web.Luxis;
 import io.kiw.luxis.web.TestLuxis;
-import io.kiw.luxis.result.Result;
 import io.kiw.luxis.web.handler.JsonHandler;
 import io.kiw.luxis.web.http.ErrorMessageResponse;
 import io.kiw.luxis.web.http.ErrorStatusCode;
@@ -11,6 +11,8 @@ import io.kiw.luxis.web.http.HttpResult;
 import io.kiw.luxis.web.http.Method;
 import io.kiw.luxis.web.http.client.LuxisAsync;
 import io.kiw.luxis.web.internal.LuxisPipeline;
+import io.kiw.luxis.web.messaging.EventPlatform;
+import io.kiw.luxis.web.messaging.EventSession;
 import io.kiw.luxis.web.pipeline.HttpStream;
 import io.kiw.luxis.web.test.StubRequest;
 import io.kiw.luxis.web.test.StubTestClient;
@@ -35,6 +37,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -45,9 +48,11 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
     private final InMemoryDatabaseClient databaseClient = new InMemoryDatabaseClient();
     private final InMemoryOutboxStore outboxStore = new InMemoryOutboxStore();
     private KafkaPublisher publisher;
-    private TestLuxis<Void> luxis;
+    private KafkaEventConsumer eventConsumer;
+    private TestLuxis<Object> luxis;
     private StubTestClient client;
     private final List<Throwable> caughtExceptions = new ArrayList<>();
+    private final CompletableFuture<Ping> receivedPing = new CompletableFuture<>();
 
     @Before
     public void setUp() {
@@ -55,13 +60,23 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
         producerConfig.put("bootstrap.servers", bootstrapServers());
         publisher = new KafkaPublisher(vertx(), producerConfig);
 
-        luxis = Luxis.test(routes -> {
-            routes.jsonRoute("/publish-tx", Method.POST, null, PublishRequest.class, new PublishInTxHandler());
-            routes.jsonRoute("/publish-tx/rollback", Method.POST, null, PublishRequest.class, new PublishInTxRollbackHandler());
-            routes.jsonRoute("/publish-tx/many", Method.POST, null, PublishManyRequest.class, new PublishManyInTxHandler());
-            routes.jsonRoute("/publish-immediate", Method.POST, null, PublishRequest.class, new PublishImmediateHandler());
-            return null;
-        }, databaseClient, publisher, outboxStore);
+        final Map<String, String> consumerConfig = new HashMap<>();
+        consumerConfig.put("bootstrap.servers", bootstrapServers());
+        consumerConfig.put("group.id", "luxis-event-consumer-" + UUID.randomUUID());
+        eventConsumer = new KafkaEventConsumer(vertx(), consumerConfig, "luxis-events-" + UUID.randomUUID());
+
+        luxis = Luxis.app(routes -> {
+                    routes.jsonRoute("/publish-tx", Method.POST, null, PublishRequest.class, new PublishInTxHandler());
+                    routes.jsonRoute("/publish-tx/rollback", Method.POST, null, PublishRequest.class, new PublishInTxRollbackHandler());
+                    routes.jsonRoute("/publish-tx/many", Method.POST, null, PublishManyRequest.class, new PublishManyInTxHandler());
+                    routes.jsonRoute("/publish-immediate", Method.POST, null, PublishRequest.class, new PublishImmediateHandler());
+                    routes.eventRoute("ping", null, Ping.class, stream -> stream
+                            .peek(ctx -> receivedPing.complete(ctx.in()))
+                            .completeWithNoResponse());
+                    return null;
+                }).withDatabase(databaseClient)
+                .withEventPlatform(EventPlatform.of(publisher, outboxStore, eventConsumer))
+                .test();
 
         client = new StubTestClient("localhost", 0, luxis);
         luxis.setExceptionHandler(e -> {
@@ -125,6 +140,20 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
         assertEquals(List.of("a", "b", "c"), values);
         assertTrue("luxis-event-id header should be stamped",
                 records.get(0).headers().lastHeader("x-luxis-event-id") != null);
+        client.assertNoMoreExceptions();
+    }
+
+    @Test
+    public void publishedEventIsReceivedByEventConsumer() throws Exception {
+        final String topic = eventConsumer.topic();
+        final String envelope = "{\\\"key\\\":\\\"ping\\\",\\\"payload\\\":{\\\"text\\\":\\\"hello-event\\\"}}";
+        final TestHttpResponse response = client.post(StubRequest.request("/publish-immediate")
+                .body("{\"topic\":\"" + topic + "\",\"message\":\"" + envelope + "\"}"));
+
+        assertEquals(response.responseBody, 200, response.statusCode);
+
+        final Ping received = receivedPing.get(20, TimeUnit.SECONDS);
+        assertEquals("hello-event", received.text);
         client.assertNoMoreExceptions();
     }
 
@@ -193,6 +222,10 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
     public static final class PublishRequest {
         public String topic;
         public String message;
+    }
+
+    public static final class Ping {
+        public String text;
     }
 
     public static final class PublishManyRequest {
