@@ -1,8 +1,8 @@
-package org.example;
+package io.kiw.luxis.kafka;
 
 import io.kiw.luxis.result.Result;
 import io.kiw.luxis.web.Luxis;
-import io.kiw.luxis.web.TestLuxis;
+import io.kiw.luxis.web.WebServiceConfigBuilder;
 import io.kiw.luxis.web.handler.JsonHandler;
 import io.kiw.luxis.web.http.ErrorMessageResponse;
 import io.kiw.luxis.web.http.ErrorStatusCode;
@@ -12,11 +12,15 @@ import io.kiw.luxis.web.http.Method;
 import io.kiw.luxis.web.http.client.LuxisAsync;
 import io.kiw.luxis.web.internal.LuxisPipeline;
 import io.kiw.luxis.web.messaging.EventPlatform;
-import io.kiw.luxis.web.messaging.EventSession;
 import io.kiw.luxis.web.pipeline.HttpStream;
+import io.kiw.luxis.web.test.StubNetwork;
 import io.kiw.luxis.web.test.StubRequest;
 import io.kiw.luxis.web.test.StubTestClient;
+import io.kiw.luxis.web.test.TestClient;
 import io.kiw.luxis.web.test.TestHttpResponse;
+import io.kiw.luxis.web.test.TestLuxis;
+import io.kiw.luxis.web.test.VertxTestClient;
+import io.vertx.core.Vertx;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -49,10 +53,9 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
     private final InMemoryOutboxStore outboxStore = new InMemoryOutboxStore();
     private KafkaPublisher publisher;
     private KafkaEventConsumer eventConsumer;
-    private TestLuxis<Object> luxis;
-    private StubTestClient client;
-    private final List<Throwable> caughtExceptions = new ArrayList<>();
+    private TestClient client;
     private final CompletableFuture<Ping> receivedPing = new CompletableFuture<>();
+    private Luxis<Object> luxis;
 
     @Before
     public void setUp() {
@@ -70,21 +73,17 @@ public class KafkaPublisherDaoTest extends KafkaDaoTestBase {
                     routes.jsonRoute("/publish-tx/rollback", Method.POST, null, PublishRequest.class, new PublishInTxRollbackHandler());
                     routes.jsonRoute("/publish-tx/many", Method.POST, null, PublishManyRequest.class, new PublishManyInTxHandler());
                     routes.jsonRoute("/publish-immediate", Method.POST, null, PublishRequest.class, new PublishImmediateHandler());
+
                     routes.eventRoute("ping", null, Ping.class, stream -> stream
                             .peek(ctx -> receivedPing.complete(ctx.in()))
                             .completeWithNoResponse());
                     return null;
-                }).withDatabase(databaseClient)
-                .withEventPlatform(EventPlatform.of(publisher, outboxStore, eventConsumer))
-                .test();
+                })
+                .withDatabase(databaseClient)
+                .withConfig(new WebServiceConfigBuilder().setPort(8080).build())
+                .withEventPlatform(EventPlatform.of(publisher, outboxStore, eventConsumer)).start(Vertx.vertx());
+        client = new VertxTestClient("localhost", 8080);
 
-        client = new StubTestClient("localhost", 0, luxis);
-        luxis.setExceptionHandler(e -> {
-            synchronized (caughtExceptions) {
-                caughtExceptions.add(e);
-            }
-            e.printStackTrace();
-        });
     }
 
     @After

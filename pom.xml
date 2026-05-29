@@ -53,7 +53,12 @@
         <dependency>
             <groupId>io.kiw.luxis</groupId>
             <artifactId>luxis</artifactId>
-            <version>0.4.0</version>
+            <version>0.5.5</version>
+        </dependency>
+        <dependency>
+            <groupId>io.kiw.luxis</groupId>
+            <artifactId>luxis-test-support</artifactId>
+            <version>0.5.5</version>
         </dependency>
         <dependency>
             <groupId>io.vertx</groupId>

@@ -1,4 +1,4 @@
-package org.example;
+package io.kiw.luxis.kafka;
 
 import io.kiw.luxis.web.messaging.EventConsumer;
 import io.kiw.luxis.web.messaging.EventDispatcher;

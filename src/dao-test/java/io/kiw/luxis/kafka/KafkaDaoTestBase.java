@@ -1,4 +1,4 @@
-package org.example;
+package io.kiw.luxis.kafka;
 
 import io.vertx.core.Vertx;
 import org.junit.AfterClass;
