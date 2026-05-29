@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# lux — developer environment helper for luxis-mysql
+#
+# Usage:
+#   ./lux setup    Ensure Docker is installed and the daemon is running.
+#   ./lux help     Show this help.
+#
+# Linux only. macOS/Windows users should follow the README.
+
+set -euo pipefail
+
+cmd_help() {
+    cat <<'EOF'
+lux — developer environment helper
+
+Commands:
+  setup     Install Docker (if missing) and start the daemon.
+  dao-test  Run the DAO tests against an ephemeral MySQL container.
+  help      Show this message.
+EOF
+}
+
+require_linux() {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        echo "lux: this script supports Linux only. See README for macOS/Windows." >&2
+        exit 1
+    fi
+}
+
+sudo_run() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+docker_socket_works() {
+    docker info >/dev/null 2>&1
+}
+
+install_docker() {
+    if comm
+    and -v docker >/dev/null 2>&1; then
+        return
+    fi
+    echo "lux: installing Docker via https://get.docker.com ..."
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "lux: 'curl' is required but not installed." >&2
+        exit 1
+    fi
+    local script
+    script="$(mktemp)"
+    trap 'rm -f "$script"' RETURN
+    curl -fsSL https://get.docker.com -o "$script"
+    sudo_run sh "$script"
+}
+
+start_daemon() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "lux: systemctl not found — start the docker daemon manually for your init system." >&2
+        return
+    fi
+    sudo_run systemctl enable --now docker
+}
+
+ensure_group_membership() {
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+        return 0
+    fi
+    echo "lux: adding $USER to the 'docker' group..."
+    sudo_run usermod -aG docker "$USER"
+    return 1
+}
+
+cmd_setup() {
+    require_linux
+
+    if docker_socket_works; then
+        echo "lux: Docker is already installed and running."
+        return 0
+    fi
+
+    install_docker
+    start_daemon
+
+    if docker_socket_works; then
+        echo "lux: Docker is ready."
+        return 0
+    fi
+
+    if ! ensure_group_membership; then
+        cat >&2 <<EOF
+
+lux: Docker is installed but your shell is not yet a member of the 'docker' group.
+     Either log out and back in, or run:
+         newgrp docker
+     then re-run: ./lux setup
+EOF
+        exit 1
+    fi
+
+    echo "lux: Docker is installed but the daemon is not reachable. Check 'systemctl status docker'." >&2
+    exit 1
+}
+
+
+cmd_deploy() {
+    echo "Running tests..."
+    TEST_MODE=VERTX mvn test
+
+    VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+    TAG="v${VERSION}"
+
+    if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+        echo "Tag ${TAG} already exists; aborting." >&2
+        exit 1
+    fi
+
+    echo "Tagging ${TAG}..."
+    git tag -a "${TAG}" -m "Release ${VERSION}"
+
+    echo "Deploying to Maven Central..."
+    mvn deploy
+
+    echo "Done. Push the tag with: git push origin ${TAG}"
+}
+
+cmd_dao_test() {
+    require_linux
+
+    if ! command -v mvn >/dev/null 2>&1; then
+        echo "lux: 'mvn' is not on PATH." >&2
+        exit 1
+    fi
+
+    if ! docker_socket_works; then
+        cat >&2 <<EOF
+lux: Docker is not reachable. Run './lux setup' first.
+EOF
+        exit 1
+    fi
+
+    # Propagate the active Docker context's socket so Testcontainers, running
+    # in a forked surefire JVM, can find the daemon — particularly for
+    # rootless installs where the socket lives under $XDG_RUNTIME_DIR.
+    local docker_host=""
+    if [[ -n "${DOCKER_HOST:-}" ]]; then
+        docker_host="$DOCKER_HOST"
+    else
+        docker_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+    fi
+    if [[ -z "$docker_host" ]]; then
+        for candidate in "/var/run/docker.sock" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock"; do
+            if [[ -S "$candidate" ]]; then
+                docker_host="unix://$candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$docker_host" ]]; then
+        echo "lux: could not locate the Docker socket; Testcontainers will likely fail." >&2
+    else
+        export DOCKER_HOST="$docker_host"
+        if [[ "$docker_host" == unix://* ]]; then
+            local socket_path="${docker_host#unix://}"
+            if [[ ! -S "$socket_path" ]]; then
+                echo "lux: socket '$socket_path' does not exist or is not a socket." >&2
+                exit 1
+            fi
+            export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE="$socket_path"
+        fi
+        echo "lux: using DOCKER_HOST=$DOCKER_HOST"
+    fi
+
+    # docker-java's default negotiated API version (1.32) is rejected by
+    # modern Docker daemons (>= 1.40 required). Pin a safe recent value.
+    export DOCKER_API_VERSION="${DOCKER_API_VERSION:-1.43}"
+
+    local project_dir
+    project_dir="$(cd "$(dirname "$0")" && pwd)"
+    cd "$project_dir"
+    exec mvn test -Pdao-test "$@"
+}
+
+main() {
+    local subcommand="${1:-help}"
+    case "$subcommand" in
+        setup) shift; cmd_setup "$@" ;;
+        dao-test) shift; cmd_dao_test "$@" ;;
+        deploy) shift; cmd_deploy "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            echo "lux: unknown command '$subcommand'" >&2
+            cmd_help >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
